@@ -14,6 +14,9 @@
     "pi-skill",
     "pi-theme"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "pi": {
     "extensions": [
       "./extensions/*.ts"

@@ -1,64 +1,82 @@
 #!/bin/bash
 
-# Check for disallowed module invocations
-for arg in "$@"; do
-    case "$arg" in
-        -mpip|-m\ pip|pip)
-            echo "Error: 'python3 -m pip' is disabled. Use uv instead:" >&2
-            echo "" >&2
-            echo "  To install a package for a script: uv run --with PACKAGE python script.py" >&2
-            echo "  To add a dependency to the project: uv add PACKAGE" >&2
-            echo "" >&2
+COMMAND_LABEL="python3"
+
+print_pip_error() {
+    echo "Error: '${COMMAND_LABEL} -m pip' is disabled. Use uv instead:" >&2
+    echo "" >&2
+    echo "  To install a package for a script: uv run --with PACKAGE python script.py" >&2
+    echo "  To add a dependency to the project: uv add PACKAGE" >&2
+    echo "" >&2
+}
+
+print_venv_error() {
+    echo "Error: '${COMMAND_LABEL} -m venv' is disabled. Use uv instead:" >&2
+    echo "" >&2
+    echo "  To create a virtual environment: uv venv" >&2
+    echo "" >&2
+}
+
+print_py_compile_error() {
+    echo "Error: '${COMMAND_LABEL} -m py_compile' is disabled because it writes .pyc files to __pycache__." >&2
+    echo "" >&2
+    echo "  To verify syntax without bytecode output: uv run python -m ast path/to/file.py >/dev/null" >&2
+    echo "" >&2
+}
+
+block_module_if_disallowed() {
+    case "$1" in
+        pip)
+            print_pip_error
             exit 1
             ;;
-        -mvenv|-m\ venv|venv)
-            echo "Error: 'python3 -m venv' is disabled. Use uv instead:" >&2
-            echo "" >&2
-            echo "  To create a virtual environment: uv venv" >&2
-            echo "" >&2
+        venv)
+            print_venv_error
             exit 1
             ;;
-        -mpy_compile|-m\ py_compile|py_compile)
-            echo "Error: 'python3 -m py_compile' is disabled because it writes .pyc files to __pycache__." >&2
-            echo "" >&2
-            echo "  To verify syntax without bytecode output: uv run python -m ast path/to/file.py >/dev/null" >&2
-            echo "" >&2
+        py_compile)
+            print_py_compile_error
             exit 1
             ;;
     esac
-done
+}
 
-# Check for -m flag followed by pip or venv
-prev=""
-for arg in "$@"; do
-    if [ "$prev" = "-m" ]; then
-        case "$arg" in
-            pip)
-                echo "Error: 'python3 -m pip' is disabled. Use uv instead:" >&2
-                echo "" >&2
-                echo "  To install a package for a script: uv run --with PACKAGE python script.py" >&2
-                echo "  To add a dependency to the project: uv add PACKAGE" >&2
-                echo "" >&2
-                exit 1
+check_disallowed_module_invocation() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --|-|-c)
+                return 0
                 ;;
-            venv)
-                echo "Error: 'python3 -m venv' is disabled. Use uv instead:" >&2
-                echo "" >&2
-                echo "  To create a virtual environment: uv venv" >&2
-                echo "" >&2
-                exit 1
+            -m)
+                shift
+                [ "$#" -gt 0 ] || return 0
+                block_module_if_disallowed "$1"
+                return 0
                 ;;
-            py_compile)
-                echo "Error: 'python3 -m py_compile' is disabled because it writes .pyc files to __pycache__." >&2
-                echo "" >&2
-                echo "  To verify syntax without bytecode output: uv run python -m ast path/to/file.py >/dev/null" >&2
-                echo "" >&2
-                exit 1
+            -m*)
+                block_module_if_disallowed "${1#-m}"
+                return 0
+                ;;
+            -W|-X|-Q|--check-hash-based-pycs)
+                shift 2 || return 0
+                ;;
+            -W*|-X*|-Q*|--check-hash-based-pycs=*)
+                shift
+                ;;
+            -*)
+                shift
+                ;;
+            *)
+                return 0
                 ;;
         esac
-    fi
-    prev="$arg"
-done
+    done
+}
+
+# Only inspect Python interpreter options. Once a script, -c, stdin, --, or a
+# non-blocked -m module is found, later words are script/module arguments and
+# must not be treated as interpreter-level `-m pip`/`-m venv`/`-m py_compile`.
+check_disallowed_module_invocation "$@"
 
 # Resolve a Python interpreter for uv. Prefer uv-managed Python to match
 # `uv run python` defaults, while still avoiding shim recursion.

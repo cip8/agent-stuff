@@ -1,123 +1,113 @@
 /**
- * UV Extension - Redirects Python tooling to uv equivalents
+ * UV Extension - steers Python tooling toward uv without replacing Pi's bash tool.
  *
- * This extension wraps the bash tool to prepend intercepted-commands to PATH,
- * which contains shim scripts that intercept common Python tooling commands
- * and redirect agents to use uv instead.
+ * The extension intercepts assistant bash tool calls before execution. It blocks
+ * disallowed Python package-management commands, prepends the local shim directory
+ * to PATH for Pi's built-in bash tool, and otherwise lets Pi's native bash
+ * implementation handle cwd, rendering, truncation, cancellation, shell config,
+ * and session metadata.
  *
  * Intercepted commands:
- * - pip/pip3: Blocked with suggestions to use `uv add` or `uv run --with`
- * - poetry: Blocked with uv equivalents (uv init, uv add, uv sync, uv run)
- * - python/python3: Redirected through `uv run` to a real interpreter path,
- *   with special handling to block `python -m pip`, `python -m venv`, and
- *   `python -m py_compile`
+ * - pip/pip3/pip3.x: blocked with suggestions to use `uv add` or `uv run --with`
+ * - poetry: blocked with uv equivalents (`uv init`, `uv add`, `uv sync`, `uv run`)
+ * - python/python3/python3.x: allowed through uv shims, except true `-m pip`,
+ *   `-m venv`, and `-m py_compile` interpreter invocations are blocked
  *
- * The shim scripts are located in the intercepted-commands directory and
- * provide helpful error messages with the equivalent uv commands.
- *
- * Note: PATH shims are bypassable via explicit interpreter paths
- * (for example `.venv/bin/python`). To close that gap, this extension also
- * blocks disallowed invocations at bash spawn time.
+ * The shim scripts live in ../intercepted-commands. PATH shims are naturally
+ * bypassable through explicit interpreter paths such as `.venv/bin/python`, so
+ * this extension also performs shell-aware preflight checks on bash commands.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool } from "@earendil-works/pi-coding-agent";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { constants } from "node:fs";
+import { access } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { applyUvPolicy, getBlockedCommandMessage, REQUIRED_SHIM_COMMANDS } from "./lib/uv-policy.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const interceptedCommandsPath = join(__dirname, "..", "intercepted-commands");
 
-function getBlockedCommandMessage(command: string): string | null {
-  // Match commands at the start of a shell segment (start/newline/; /&& /|| /|)
-  const pipCommandPattern = /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?pip\s*(?:$|\s)/m;
-  const pip3CommandPattern = /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?pip3\s*(?:$|\s)/m;
-  const poetryCommandPattern = /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?poetry\s*(?:$|\s)/m;
+function isBuiltInBashTool(pi: ExtensionAPI): boolean {
+  try {
+    const bashTool = pi.getAllTools().find((tool) => tool.name === "bash");
+    return bashTool?.sourceInfo?.source === "builtin";
+  } catch {
+    // If the registry is temporarily unavailable, prefer preserving the intended
+    // local behavior over silently failing to prepend the shim path.
+    return true;
+  }
+}
 
-  // Match python invocations including explicit paths like .venv/bin/python
-  // and .venv/bin/python3.12.
-  const pythonPipPattern =
-    /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?python(?:3(?:\.\d+)?)?\b[^\n;|&]*(?:\s-m\s*pip\b|\s-mpip\b)/m;
-  const pythonVenvPattern =
-    /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?python(?:3(?:\.\d+)?)?\b[^\n;|&]*(?:\s-m\s*venv\b|\s-mvenv\b)/m;
-  const pythonPyCompilePattern =
-    /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?python(?:3(?:\.\d+)?)?\b[^\n;|&]*(?:\s-m\s*py_compile\b|\s-mpy_compile\b)/m;
+async function collectValidationProblems(pi: ExtensionAPI): Promise<string[]> {
+  const problems: string[] = [];
 
-  if (pipCommandPattern.test(command)) {
-    return [
-      "Error: pip is disabled. Use uv instead:",
-      "",
-      "  To install a package for a script: uv run --with PACKAGE python script.py",
-      "  To add a dependency to the project: uv add PACKAGE",
-      "",
-    ].join("\n");
+  for (const command of REQUIRED_SHIM_COMMANDS) {
+    const shimPath = join(interceptedCommandsPath, command);
+    try {
+      await access(shimPath, constants.X_OK);
+    } catch {
+      problems.push(`missing or non-executable shim: ${shimPath}`);
+    }
   }
 
-  if (pip3CommandPattern.test(command)) {
-    return [
-      "Error: pip3 is disabled. Use uv instead:",
-      "",
-      "  To install a package for a script: uv run --with PACKAGE python script.py",
-      "  To add a dependency to the project: uv add PACKAGE",
-      "",
-    ].join("\n");
+  try {
+    const result = await pi.exec("uv", ["--version"], { timeout: 5000 });
+    if (result.code !== 0) {
+      const detail = (result.stderr || result.stdout).trim();
+      problems.push(`uv --version failed${detail ? `: ${detail}` : ""}`);
+    }
+  } catch (error) {
+    problems.push(`uv is not available: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  if (poetryCommandPattern.test(command)) {
-    return [
-      "Error: poetry is disabled. Use uv instead:",
-      "",
-      "  To initialize a project: uv init",
-      "  To add a dependency: uv add PACKAGE",
-      "  To sync dependencies: uv sync",
-      "  To run commands: uv run COMMAND",
-      "",
-    ].join("\n");
-  }
-
-  if (pythonPipPattern.test(command)) {
-    return [
-      "Error: 'python -m pip' is disabled. Use uv instead:",
-      "",
-      "  To install a package for a script: uv run --with PACKAGE python script.py",
-      "  To add a dependency to the project: uv add PACKAGE",
-      "",
-    ].join("\n");
-  }
-
-  if (pythonVenvPattern.test(command)) {
-    return [
-      "Error: 'python -m venv' is disabled. Use uv instead:",
-      "",
-      "  To create a virtual environment: uv venv",
-      "",
-    ].join("\n");
-  }
-
-  if (pythonPyCompilePattern.test(command)) {
-    return [
-      "Error: 'python -m py_compile' is disabled because it writes .pyc files to __pycache__.",
-      "",
-      "  To verify syntax without bytecode output: uv run python -m ast path/to/file.py >/dev/null",
-      "",
-    ].join("\n");
-  }
-
-  return null;
+  return problems;
 }
 
 export default function (pi: ExtensionAPI) {
-  const cwd = process.cwd();
-  const bashTool = createBashTool(cwd, {
-    commandPrefix: `export PATH="${interceptedCommandsPath}:$PATH"`,
-    spawnHook: (ctx) => {
-      const blockedMessage = getBlockedCommandMessage(ctx.command);
-      if (blockedMessage) {
-        throw new Error(blockedMessage);
-      }
-      return ctx;
-    },
+  let validationWarningShown = false;
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (validationWarningShown) return undefined;
+
+    const problems = await collectValidationProblems(pi);
+    if (problems.length === 0) return undefined;
+
+    validationWarningShown = true;
+    ctx.ui.notify(`uv extension is not fully configured:\n${problems.map((problem) => `- ${problem}`).join("\n")}`, "warning");
+    return undefined;
   });
 
-  pi.registerTool(bashTool);
+  pi.on("tool_call", (event) => {
+    if (!isToolCallEventType("bash", event)) return undefined;
+
+    const decision = applyUvPolicy(event.input.command, {
+      interceptedCommandsPath,
+      prependPath: isBuiltInBashTool(pi),
+    });
+
+    if (decision.action === "block") {
+      return { block: true, reason: decision.reason };
+    }
+
+    event.input.command = decision.command;
+    return undefined;
+  });
+
+  pi.on("user_bash", (event) => {
+    // user_bash handlers cannot safely chain command mutations. For compatibility
+    // with SSH/sandbox/user-bash extensions, only block disallowed commands here;
+    // allowed manual commands continue through Pi's normal user-bash path unchanged.
+    const blockedMessage = getBlockedCommandMessage(event.command);
+    if (!blockedMessage) return undefined;
+
+    return {
+      result: {
+        output: blockedMessage,
+        exitCode: 1,
+        cancelled: false,
+        truncated: false,
+      },
+    };
+  });
 }
